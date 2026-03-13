@@ -1,12 +1,13 @@
+#!/usr/bin/env python
 import asyncio
 import os
 import typing
 from collections import defaultdict
 from uuid import UUID
 
-from dotenv import load_dotenv
+import asyncpg
+from loguru import logger
 
-import muforge
 from rhost import Database, MushAttribute, MushObject, ObjectType, parse_flatfile
 
 ACCOUNTS_MUSH: dict[int, MushObject] = dict()
@@ -59,6 +60,7 @@ async def prepare_accounts(db: Database):
             "password": password,
             "name": name,
             "email": email,
+            "created_at": account.csecs,
         }
 
 
@@ -134,8 +136,83 @@ async def prepare_themes(db: Database):
     pass
 
 
+async def migrate_characters(conn: asyncpg.Connection, db: Database):
+    for k, v in ACCOUNTS_CHARACTERS.items():
+        user_id = ACCOUNTS_MAP[k]
+        account = ACCOUNTS_MUSH[k]
+        for char in v:
+            data = CHARACTERS_DATA[char.dbref]
+            character_row = await conn.fetchrow(
+                """
+                INSERT INTO pcs (user_id, name, created_at, admin_mantle, approved_at)
+                VALUES ($1, $2, to_timestamp($3), $4, to_timestamp($5))
+                RETURNING *
+                """,
+                user_id,
+                char.name,
+                char.csecs,
+                char.bitlevel,
+                data["approved"],
+            )
+
+            character_id = character_row["id"]
+            CHARACTERS_MAP[char.dbref] = character_id
+            logger.info(f"Character {char} migrated for user {account}")
+
+
+async def migrate_accounts(conn: asyncpg.Connection, db: Database):
+    for k, v in ACCOUNTS_DATA.items():
+        user_row = await conn.fetchrow(
+            """
+            INSERT INTO users (username, admin_level, created_at)
+            VALUES ($1, $2, to_timestamp($3))
+            RETURNING *
+            """,
+            v["name"],
+            v["admin_level"],
+            v["created_at"],
+        )
+
+        user_id = user_row["id"]
+        ACCOUNTS_MAP[k] = user_id
+
+        if email := v.get("email", None):
+            await conn.execute(
+                """
+                INSERT INTO emails (user_id, email)
+                VALUES ($1, $2)
+                """,
+                user_id,
+                email,
+            )
+
+        password_row = await conn.fetchrow(
+            """
+            INSERT INTO passwords (user_id, password_hash)
+            VALUES ($1, $2)
+            RETURNING id
+            """,
+            user_id,
+            v["password"],
+        )
+        password_id = password_row["id"]
+
+        await conn.execute(
+            "UPDATE users SET current_password_id=$1 WHERE id=$2",
+            password_id,
+            user_id,
+        )
+        logger.info(f"User {v} migrated")
+
+
+async def migrate(conn: asyncpg.Connection, db: Database):
+    await migrate_accounts(conn, db)
+    await migrate_characters(conn, db)
+
+
 async def prepare():
-    data = parse_flatfile("netrhost.db.flat")
+    data = parse_flatfile("/home/volund/code/muconvergence/netrhost.db.flat")
+    data.objects.pop(1211, None)
     await prepare_accounts(data)
     await prepare_pcs(data)
     await prepare_factions(data)
@@ -145,16 +222,22 @@ async def prepare():
 
 async def main():
     # do a basic setup of the game in order to init postgres
-    from muforge.shared.utils import get_config, setup_program
+    from muforge.utils.boot import get_config, setup_program
+    from muforge.utils.misc import property_from_module
 
+    os.chdir("/home/volund/code/mucrucible")
     config = get_config("game")
     await setup_program("game", config)
-    app_class = muforge.CLASSES["application"]
-    app = app_class()
-    muforge.APP = app
+    app_class = property_from_module(config["GAME"]["class"])
+    app = app_class(config)
     await app.setup()
 
-    db = await prepare()
+    mush = await prepare()
+    core = app.plugins["core"]
+    db = core.db
+
+    async with db.transaction() as conn:
+        await migrate(conn, db)
 
 
 if __name__ == "__main__":
